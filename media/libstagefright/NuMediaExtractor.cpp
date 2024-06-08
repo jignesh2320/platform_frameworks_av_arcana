@@ -72,6 +72,37 @@ NuMediaExtractor::~NuMediaExtractor() {
     }
 }
 
+status_t NuMediaExtractor::initMediaExtractor(const sp<DataSource>& dataSource) {
+    status_t err = OK;
+
+    mImpl = MediaExtractorFactory::Create(dataSource);
+    if (mImpl == NULL) {
+        ALOGE("%s: failed to create MediaExtractor", __FUNCTION__);
+        return ERROR_UNSUPPORTED;
+    }
+
+    setEntryPointToRemoteMediaExtractor();
+
+    if (!mCasToken.empty()) {
+        err = mImpl->setMediaCas(mCasToken);
+        if (err != OK) {
+            ALOGE("%s: failed to setMediaCas (%d)", __FUNCTION__, err);
+            return err;
+        }
+    }
+
+    // Get the name of the implementation.
+    mName = mImpl->name();
+
+    // Update the duration and bitrate
+    err = updateDurationAndBitrate();
+    if (err == OK) {
+        mDataSource = dataSource;
+    }
+
+    return OK;
+}
+
 status_t NuMediaExtractor::setDataSource(
         const sp<MediaHTTPService> &httpService,
         const char *path,
@@ -89,28 +120,8 @@ status_t NuMediaExtractor::setDataSource(
         return -ENOENT;
     }
 
-    mImpl = MediaExtractorFactory::Create(dataSource);
-
-    if (mImpl == NULL) {
-        return ERROR_UNSUPPORTED;
-    }
-    setEntryPointToRemoteMediaExtractor();
-
-    status_t err = OK;
-    if (!mCasToken.empty()) {
-        err = mImpl->setMediaCas(mCasToken);
-        if (err != OK) {
-            ALOGE("%s: failed to setMediaCas (%d)", __FUNCTION__, err);
-            return err;
-        }
-    }
-
-    err = updateDurationAndBitrate();
-    if (err == OK) {
-        mDataSource = dataSource;
-    }
-
-    return OK;
+    // Initialize MediaExtractor using the data source
+    return initMediaExtractor(dataSource);
 }
 
 status_t NuMediaExtractor::setDataSource(int fd, off64_t offset, off64_t size) {
@@ -131,27 +142,8 @@ status_t NuMediaExtractor::setDataSource(int fd, off64_t offset, off64_t size) {
         return err;
     }
 
-    mImpl = MediaExtractorFactory::Create(fileSource);
-
-    if (mImpl == NULL) {
-        return ERROR_UNSUPPORTED;
-    }
-    setEntryPointToRemoteMediaExtractor();
-
-    if (!mCasToken.empty()) {
-        err = mImpl->setMediaCas(mCasToken);
-        if (err != OK) {
-            ALOGE("%s: failed to setMediaCas (%d)", __FUNCTION__, err);
-            return err;
-        }
-    }
-
-    err = updateDurationAndBitrate();
-    if (err == OK) {
-        mDataSource = fileSource;
-    }
-
-    return OK;
+    // Initialize MediaExtractor using the file source
+    return initMediaExtractor(fileSource);
 }
 
 status_t NuMediaExtractor::setDataSource(const sp<DataSource> &source) {
@@ -166,32 +158,13 @@ status_t NuMediaExtractor::setDataSource(const sp<DataSource> &source) {
         return err;
     }
 
-    mImpl = MediaExtractorFactory::Create(source);
-
-    if (mImpl == NULL) {
-        return ERROR_UNSUPPORTED;
-    }
-    setEntryPointToRemoteMediaExtractor();
-
-    if (!mCasToken.empty()) {
-        err = mImpl->setMediaCas(mCasToken);
-        if (err != OK) {
-            ALOGE("%s: failed to setMediaCas (%d)", __FUNCTION__, err);
-            return err;
-        }
-    }
-
-    err = updateDurationAndBitrate();
-    if (err == OK) {
-        mDataSource = source;
-    }
-
-    return err;
+    // Initialize MediaExtractor using the given data source
+    return initMediaExtractor(source);
 }
 
 const char* NuMediaExtractor::getName() const {
     Mutex::Autolock autoLock(mLock);
-    return mImpl == nullptr ? nullptr : mImpl->name().string();
+    return mImpl == nullptr ? nullptr : mName.string();
 }
 
 static String8 arrayToString(const std::vector<uint8_t> &array) {
@@ -666,9 +639,11 @@ status_t NuMediaExtractor::appendVorbisNumPageSamples(
         numPageSamples = -1;
     }
 
+    // insert, including accounting for the space used.
     memcpy((uint8_t *)buffer->data() + mbuf->range_length(),
            &numPageSamples,
            sizeof(numPageSamples));
+    buffer->setRange(buffer->offset(), buffer->size() + sizeof(numPageSamples));
 
     uint32_t type;
     const void *data;
@@ -717,6 +692,8 @@ status_t NuMediaExtractor::readSampleData(const sp<ABuffer> &buffer) {
 
     ssize_t minIndex = fetchAllTrackSamples();
 
+    buffer->setRange(0, 0);     // start with an empty buffer
+
     if (minIndex < 0) {
         return ERROR_END_OF_STREAM;
     }
@@ -732,23 +709,23 @@ status_t NuMediaExtractor::readSampleData(const sp<ABuffer> &buffer) {
         sampleSize += sizeof(int32_t);
     }
 
+    // capacity() is ok since we cleared out the buffer
     if (buffer->capacity() < sampleSize) {
         return -ENOMEM;
     }
 
+    const size_t srclen = it->mBuffer->range_length();
     const uint8_t *src =
         (const uint8_t *)it->mBuffer->data()
             + it->mBuffer->range_offset();
 
-    memcpy((uint8_t *)buffer->data(), src, it->mBuffer->range_length());
+    memcpy((uint8_t *)buffer->data(), src, srclen);
+    buffer->setRange(0, srclen);
 
     status_t err = OK;
     if (info->mTrackFlags & kIsVorbis) {
+        // adjusts range when it inserts the extra bits
         err = appendVorbisNumPageSamples(it->mBuffer, buffer);
-    }
-
-    if (err == OK) {
-        buffer->setRange(0, sampleSize);
     }
 
     return err;
